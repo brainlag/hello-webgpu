@@ -1,6 +1,16 @@
 #include "webgpu.h"
-
+#include "imgui.h"
+#include "imgui_impl_sdl.h"
+#include "imgui_impl_wgpu.h"
+#include <SDL.h>
 #include <string.h>
+#include <stdio.h>
+#include <iostream>
+#include "json.hpp"
+
+#define SOKOL_FETCH_IMPL
+#include "sokol_fetch.h"
+#include "stb_image.h"
 
 WGPUDevice device;
 WGPUQueue queue;
@@ -12,15 +22,13 @@ WGPUBuffer indxBuf; // index buffer
 WGPUBuffer uRotBuf; // uniform buffer (containing the rotation angle)
 WGPUBindGroup bindGroup;
 
-/*
- * Workaround for Dawn currently expecting 'undefined' for entire buffers and
- * Emscripten/Chrome still expecting zero.
- */
-#ifndef __EMSCRIPTEN__
-#define ZERO_BUFFER_SIZE WGPU_WHOLE_SIZE
-#else
-#define ZERO_BUFFER_SIZE 0
-#endif
+struct Resources {
+	WGPUTexture texture1;
+	WGPUBuffer buffer1;
+	WGPUBuffer buffer2;
+};
+
+static Resources resources;
 
 /**
  * Current rotation angle (in degrees, updated per frame).
@@ -28,92 +36,23 @@ WGPUBindGroup bindGroup;
 float rotDeg = 0.0f;
 
 /**
- * Vertex shader SPIR-V.
- * \code
- *	// glslc -Os -mfmt=num -o - -c in.vert
- *	#version 450
- *	layout(set = 0, binding = 0) uniform Rotation {
- *		float uRot;
- *	};
- *	layout(location = 0) in  vec2 aPos;
- *	layout(location = 1) in  vec3 aCol;
- *	layout(location = 0) out vec3 vCol;
- *	void main() {
- *		float cosA = cos(radians(uRot));
- *		float sinA = sin(radians(uRot));
- *		mat3 rot = mat3(cosA, sinA, 0.0,
- *					   -sinA, cosA, 0.0,
- *						0.0,  0.0,  1.0);
- *		gl_Position = vec4(rot * vec3(aPos, 1.0), 1.0);
- *		vCol = aCol;
- *	}
- * \endcode
- */
-static uint32_t const triangle_vert_spirv[] = {
-	0x07230203, 0x00010000, 0x000d0008, 0x00000043, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
-	0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
-	0x0009000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000002d, 0x00000031, 0x0000003e,
-	0x00000040, 0x00050048, 0x00000009, 0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x00000009,
-	0x00000002, 0x00040047, 0x0000000b, 0x00000022, 0x00000000, 0x00040047, 0x0000000b, 0x00000021,
-	0x00000000, 0x00050048, 0x0000002b, 0x00000000, 0x0000000b, 0x00000000, 0x00050048, 0x0000002b,
-	0x00000001, 0x0000000b, 0x00000001, 0x00050048, 0x0000002b, 0x00000002, 0x0000000b, 0x00000003,
-	0x00050048, 0x0000002b, 0x00000003, 0x0000000b, 0x00000004, 0x00030047, 0x0000002b, 0x00000002,
-	0x00040047, 0x00000031, 0x0000001e, 0x00000000, 0x00040047, 0x0000003e, 0x0000001e, 0x00000000,
-	0x00040047, 0x00000040, 0x0000001e, 0x00000001, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
-	0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x0003001e, 0x00000009, 0x00000006, 0x00040020,
-	0x0000000a, 0x00000002, 0x00000009, 0x0004003b, 0x0000000a, 0x0000000b, 0x00000002, 0x00040015,
-	0x0000000c, 0x00000020, 0x00000001, 0x0004002b, 0x0000000c, 0x0000000d, 0x00000000, 0x00040020,
-	0x0000000e, 0x00000002, 0x00000006, 0x00040017, 0x00000018, 0x00000006, 0x00000003, 0x00040018,
-	0x00000019, 0x00000018, 0x00000003, 0x0004002b, 0x00000006, 0x0000001e, 0x00000000, 0x0004002b,
-	0x00000006, 0x00000022, 0x3f800000, 0x00040017, 0x00000027, 0x00000006, 0x00000004, 0x00040015,
-	0x00000028, 0x00000020, 0x00000000, 0x0004002b, 0x00000028, 0x00000029, 0x00000001, 0x0004001c,
-	0x0000002a, 0x00000006, 0x00000029, 0x0006001e, 0x0000002b, 0x00000027, 0x00000006, 0x0000002a,
-	0x0000002a, 0x00040020, 0x0000002c, 0x00000003, 0x0000002b, 0x0004003b, 0x0000002c, 0x0000002d,
-	0x00000003, 0x00040017, 0x0000002f, 0x00000006, 0x00000002, 0x00040020, 0x00000030, 0x00000001,
-	0x0000002f, 0x0004003b, 0x00000030, 0x00000031, 0x00000001, 0x00040020, 0x0000003b, 0x00000003,
-	0x00000027, 0x00040020, 0x0000003d, 0x00000003, 0x00000018, 0x0004003b, 0x0000003d, 0x0000003e,
-	0x00000003, 0x00040020, 0x0000003f, 0x00000001, 0x00000018, 0x0004003b, 0x0000003f, 0x00000040,
-	0x00000001, 0x0006002c, 0x00000018, 0x00000042, 0x0000001e, 0x0000001e, 0x00000022, 0x00050036,
-	0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x00050041, 0x0000000e,
-	0x0000000f, 0x0000000b, 0x0000000d, 0x0004003d, 0x00000006, 0x00000010, 0x0000000f, 0x0006000c,
-	0x00000006, 0x00000011, 0x00000001, 0x0000000b, 0x00000010, 0x0006000c, 0x00000006, 0x00000012,
-	0x00000001, 0x0000000e, 0x00000011, 0x0006000c, 0x00000006, 0x00000017, 0x00000001, 0x0000000d,
-	0x00000011, 0x0004007f, 0x00000006, 0x00000020, 0x00000017, 0x00060050, 0x00000018, 0x00000023,
-	0x00000012, 0x00000017, 0x0000001e, 0x00060050, 0x00000018, 0x00000024, 0x00000020, 0x00000012,
-	0x0000001e, 0x00060050, 0x00000019, 0x00000026, 0x00000023, 0x00000024, 0x00000042, 0x0004003d,
-	0x0000002f, 0x00000032, 0x00000031, 0x00050051, 0x00000006, 0x00000033, 0x00000032, 0x00000000,
-	0x00050051, 0x00000006, 0x00000034, 0x00000032, 0x00000001, 0x00060050, 0x00000018, 0x00000035,
-	0x00000033, 0x00000034, 0x00000022, 0x00050091, 0x00000018, 0x00000036, 0x00000026, 0x00000035,
-	0x00050051, 0x00000006, 0x00000037, 0x00000036, 0x00000000, 0x00050051, 0x00000006, 0x00000038,
-	0x00000036, 0x00000001, 0x00050051, 0x00000006, 0x00000039, 0x00000036, 0x00000002, 0x00070050,
-	0x00000027, 0x0000003a, 0x00000037, 0x00000038, 0x00000039, 0x00000022, 0x00050041, 0x0000003b,
-	0x0000003c, 0x0000002d, 0x0000000d, 0x0003003e, 0x0000003c, 0x0000003a, 0x0004003d, 0x00000018,
-	0x00000041, 0x00000040, 0x0003003e, 0x0000003e, 0x00000041, 0x000100fd, 0x00010038
-};
-
-/**
  * WGSL equivalent of \c triangle_vert_spirv.
  */
 static char const triangle_vert_wgsl[] = R"(
-	let PI : f32 = 3.141592653589793;
-	fn radians(degs : f32) -> f32 {
-		return (degs * PI) / 180.0;
-	}
-	[[block]]
 	struct VertexIn {
-		[[location(0)]] aPos : vec2<f32>;
-		[[location(1)]] aCol : vec3<f32>;
+		@location(0) aPos : vec2<f32>;
+		@location(1) aCol : vec3<f32>;
 	};
 	struct VertexOut {
-		[[location(0)]] vCol : vec3<f32>;
-		[[builtin(position)]] Position : vec4<f32>;
+		@location(0) vCol : vec3<f32>;
+		@builtin(position) Position : vec4<f32>;
 	};
-	[[block]]
+
 	struct Rotation {
-		[[location(0)]] degs : f32;
+		@location(0) degs : f32;
 	};
-	[[group(0), binding(0)]] var<uniform> uRot : Rotation;
-	[[stage(vertex)]]
+	@group(0)  @binding(0) var<uniform> uRot : Rotation;
+	@stage(vertex)
 	fn main(input : VertexIn) -> VertexOut {
 		var rads : f32 = radians(uRot.degs);
 		var cosA : f32 = cos(rads);
@@ -129,41 +68,13 @@ static char const triangle_vert_wgsl[] = R"(
 	}
 )";
 
-/**
- * Fragment shader SPIR-V.
- * \code
- *	// glslc -Os -mfmt=num -o - -c in.frag
- *	#version 450
- *	layout(location = 0) in  vec3 vCol;
- *	layout(location = 0) out vec4 fragColor;
- *	void main() {
- *		fragColor = vec4(vCol, 1.0);
- *	}
- * \endcode
- */
-static uint32_t const triangle_frag_spirv[] = {
-	0x07230203, 0x00010000, 0x000d0007, 0x00000013, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
-	0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
-	0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x0000000c, 0x00030010,
-	0x00000004, 0x00000007, 0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00040047, 0x0000000c,
-	0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
-	0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008,
-	0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009, 0x00000003, 0x00040017, 0x0000000a,
-	0x00000006, 0x00000003, 0x00040020, 0x0000000b, 0x00000001, 0x0000000a, 0x0004003b, 0x0000000b,
-	0x0000000c, 0x00000001, 0x0004002b, 0x00000006, 0x0000000e, 0x3f800000, 0x00050036, 0x00000002,
-	0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x0000000a, 0x0000000d,
-	0x0000000c, 0x00050051, 0x00000006, 0x0000000f, 0x0000000d, 0x00000000, 0x00050051, 0x00000006,
-	0x00000010, 0x0000000d, 0x00000001, 0x00050051, 0x00000006, 0x00000011, 0x0000000d, 0x00000002,
-	0x00070050, 0x00000007, 0x00000012, 0x0000000f, 0x00000010, 0x00000011, 0x0000000e, 0x0003003e,
-	0x00000009, 0x00000012, 0x000100fd, 0x00010038
-};
 
 /**
  * WGSL equivalent of \c triangle_frag_spirv.
  */
 static char const triangle_frag_wgsl[] = R"(
-	[[stage(fragment)]]
-	fn main([[location(0)]] vCol : vec3<f32>) -> [[location(0)]] vec4<f32> {
+	@stage(fragment)
+	fn main(@location(0) vCol : vec3<f32>) -> @location(0) vec4<f32> {
 		return vec4<f32>(vCol, 1.0);
 	}
 )";
@@ -202,6 +113,27 @@ static WGPUShaderModule createShader(const char* const code, const char* label =
 	return wgpuDeviceCreateShaderModule(device, &desc);
 }
 
+static WGPUTexture createTexture(const void* data, uint32_t width, uint32_t height) {
+	int size_pp = 4; // guess 4 bytes per pixel
+	WGPUTextureDescriptor tex = {};
+	tex.dimension = WGPUTextureDimension_2D;
+	tex.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+	tex.format = WGPUTextureFormat_BGRA8Unorm;
+	tex.size = { .width = width, .height = height};
+	WGPUTexture texture = wgpuDeviceCreateTexture(device, &tex);
+	WGPUImageCopyTexture copyTex = {};
+	copyTex.texture = texture;
+	copyTex.mipLevel = 0;
+	copyTex.origin = { 0, 0, 0 };
+	copyTex.aspect = WGPUTextureAspect_All;
+	WGPUTextureDataLayout layout = {};
+	layout.offset = 0;
+	layout.bytesPerRow = width * size_pp;
+	layout.rowsPerImage = height;
+	WGPUExtent3D size = {width, height, 1 };
+	wgpuQueueWriteTexture(queue, &copyTex, data, width * height * size_pp, &layout, &size);
+}
+
 /**
  * Helper to create a buffer.
  *
@@ -227,9 +159,7 @@ static void createPipelineAndBuffers() {
 	WGPUShaderModule vertMod = createShader(triangle_vert_wgsl);
 	WGPUShaderModule fragMod = createShader(triangle_frag_wgsl);
 	
-	// keep the old unused SPIR-V shaders around for a while...
-	(void) triangle_vert_spirv;
-	(void) triangle_frag_spirv;
+
 
 	WGPUBufferBindingLayout buf = {};
 	buf.type = WGPUBufferBindingType_Uniform;
@@ -260,6 +190,7 @@ static void createPipelineAndBuffers() {
 	vertAttrs[1].offset = 2 * sizeof(float);
 	vertAttrs[1].shaderLocation = 1;
 	WGPUVertexBufferLayout vertexBufferLayout = {};
+	vertexBufferLayout.stepMode = WGPUVertexStepMode_Vertex;
 	vertexBufferLayout.arrayStride = 5 * sizeof(float);
 	vertexBufferLayout.attributeCount = 2;
 	vertexBufferLayout.attributes = vertAttrs;
@@ -349,15 +280,31 @@ static void createPipelineAndBuffers() {
 /**
  * Draws using the above pipeline and buffers.
  */
-static bool redraw() {
-	WGPUTextureView backBufView = wgpuSwapChainGetCurrentTextureView(swapchain);			// create textureView
 
+static bool show_demo_window = true;
+static bool redraw() {
+
+	sfetch_dowork(); 
+
+ 	SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        ImGui_ImplSDL2_ProcessEvent(&event);	
+	}
+
+	ImGui_ImplWGPU_NewFrame();
+	ImGui_ImplSDL2_NewFrame();
+	ImGui::NewFrame();
+
+  	ImGui::ShowDemoWindow(&show_demo_window);
+	ImGui::Render();
+
+	WGPUTextureView backBufView = wgpuSwapChainGetCurrentTextureView(swapchain);
 	WGPURenderPassColorAttachment colorDesc = {};
 	colorDesc.view    = backBufView;
 	colorDesc.loadOp  = WGPULoadOp_Clear;
 	colorDesc.storeOp = WGPUStoreOp_Store;
 	colorDesc.clearColor.r = 0.3f;
-	colorDesc.clearColor.g = 0.3f;
+	colorDesc.clearColor.g = 1.0f;
 	colorDesc.clearColor.b = 0.3f;
 	colorDesc.clearColor.a = 1.0f;
 
@@ -375,16 +322,17 @@ static bool redraw() {
 	// draw the triangle (comment these five lines to simply clear the screen)
 	wgpuRenderPassEncoderSetPipeline(pass, pipeline);
 	wgpuRenderPassEncoderSetBindGroup(pass, 0, bindGroup, 0, 0);
-	wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vertBuf, 0, ZERO_BUFFER_SIZE);
-	wgpuRenderPassEncoderSetIndexBuffer(pass, indxBuf, WGPUIndexFormat_Uint16, 0, ZERO_BUFFER_SIZE);
+	wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vertBuf, 0, WGPU_WHOLE_SIZE); //60
+	wgpuRenderPassEncoderSetIndexBuffer(pass, indxBuf, WGPUIndexFormat_Uint16, 0, WGPU_WHOLE_SIZE); //8
 	wgpuRenderPassEncoderDrawIndexed(pass, 3, 1, 0, 0, 0);
 
-	wgpuRenderPassEncoderEndPass(pass);
-	wgpuRenderPassEncoderRelease(pass);														// release pass
+	ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), pass);
+	wgpuRenderPassEncoderEnd(pass);
 	WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, nullptr);				// create commands
-	wgpuCommandEncoderRelease(encoder);														// release encoder
 
 	wgpuQueueSubmit(queue, 1, &commands);
+	wgpuRenderPassEncoderRelease(pass);														// release pass
+	wgpuCommandEncoderRelease(encoder);														// release encoder
 	wgpuCommandBufferRelease(commands);														// release commands
 #ifndef __EMSCRIPTEN__
 	/*
@@ -397,13 +345,57 @@ static bool redraw() {
 	return true;
 }
 
+void response_callback(const sfetch_response_t* response) {
+	if (response->fetched) {
+		// data has been loaded, and is available via
+		// 'buffer_ptr' and 'fetched_size':
+		const void* data = response->buffer_ptr;
+		uint64_t num_bytes = response->fetched_size;
+		std::string path(response->path);
+		
+	}
+	if (response->finished) {
+			printf("Done\n");
+		if (response->failed) {
+			printf("Failed\n");
+		}
+	}
+}
+
+// 937 * 1920 
 extern "C" int __main__(int /*argc*/, char* /*argv*/[]) {
 	if (window::Handle wHnd = window::create()) {
+
+		const sfetch_desc_t &a = { 0 };
+		sfetch_setup(a);
+
+		static uint8_t buf[1024 * 1024];
+
+		const sfetch_request_t &req = {
+            .path = "screenshot.png",
+            .callback = response_callback,
+            .buffer_ptr = buf,
+            .buffer_size = sizeof(buf)
+        };
+
+        sfetch_send(req);
+
+		SDL_Init(SDL_INIT_NOPARACHUTE);
+		SDL_Window *window = SDL_CreateWindow("Egal", 0, 0, 1900, 937, 0);
+
+		IMGUI_CHECKVERSION();
+    	ImGui::CreateContext();
+    	ImGuiIO& io = ImGui::GetIO(); 
+		io.IniFilename = NULL;
+		ImGui::StyleColorsDark();
+
+		ImGui_ImplSDL2_InitForSDLRenderer(window, NULL);
 		if ((device = webgpu::create(wHnd))) {
 			queue = wgpuDeviceGetQueue(device);
 			swapchain = webgpu::createSwapChain(device);
+    		ImGui_ImplWGPU_Init(device, 3, WGPUTextureFormat_BGRA8Unorm);
+			ImGui_ImplWGPU_CreateDeviceObjects();
 			createPipelineAndBuffers();
-
 			window::show(wHnd);
 			window::loop(wHnd, redraw);
 

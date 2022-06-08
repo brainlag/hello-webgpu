@@ -14,6 +14,7 @@ out/ARM64/
 *.suo
 *.opensdf
 *.aps
+*.pdb
 
 # Mac meta files
 .DS_Store
@@ -23,3 +24,5 @@ out/ARM64/
 *.pbxuser
 *.xcworkspace
 xcuserdata/
+
+build

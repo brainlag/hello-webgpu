@@ -90,22 +90,25 @@ static WGPUTextureFormat swapPref;
  * \param[in] type2nd optional fallback \e backend type (or \c WGPUBackendType_Null to pick the first choice or nothing)
  * \return the best choice adapter or an empty adapter wrapper
  */
+
+static std::unique_ptr<dawn::native::Instance> instance;
+
 static dawn_native::Adapter requestAdapter(WGPUBackendType type1st, WGPUBackendType type2nd = WGPUBackendType_Null) {
-	static dawn_native::Instance instance;
-	instance.DiscoverDefaultAdapters();
+	instance = std::make_unique<dawn_native::Instance>();
+	instance.get()->DiscoverDefaultAdapters();
 	wgpu::AdapterProperties properties;
-	std::vector<dawn_native::Adapter> adapters = instance.GetAdapters();
-	for (auto it = adapters.begin(); it != adapters.end(); ++it) {
-		it->GetProperties(&properties);
+	auto adapters = instance->GetAdapters();
+	for (auto &adapter : adapters) {
+		adapter.GetProperties(&properties);
 		if (static_cast<WGPUBackendType>(properties.backendType) == type1st) {
-			return *it;
+			return adapter;
 		}
 	}
 	if (type2nd) {
-		for (auto it = adapters.begin(); it != adapters.end(); ++it) {
-			it->GetProperties(&properties);
+		for (auto &adapter : adapters) {
+			adapter.GetProperties(&properties);
 			if (static_cast<WGPUBackendType>(properties.backendType) == type2nd) {
-				return *it;
+				return adapter;
 			}
 		}
 	}
