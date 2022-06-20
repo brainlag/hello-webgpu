@@ -8,9 +8,20 @@
 #include <iostream>
 #include "json.hpp"
 
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/hash.hpp>
+
 #define SOKOL_FETCH_IMPL
 #include "sokol_fetch.h"
 #include "stb_image.h"
+
+#define TINYOBJLOADER_IMPLEMENTATION
+#include "tiny_obj_loader.h"
 
 WGPUDevice device;
 WGPUQueue queue;
@@ -24,11 +35,75 @@ WGPUBindGroup bindGroup;
 
 struct Resources {
 	WGPUTexture texture1;
-	WGPUBuffer buffer1;
-	WGPUBuffer buffer2;
+	Model *model;
 };
 
 static Resources resources;
+
+struct Vertex {
+    glm::vec3 pos;
+    glm::vec3 color;
+    glm::vec2 texCoord;
+
+	bool operator==(const Vertex& other) const {
+			return pos == other.pos && color == other.color && texCoord == other.texCoord;
+		}
+};
+
+struct Model {
+	std::vector<Vertex> vertices;
+	std::vector<uint32_t> indices;
+};
+
+static Model* loadModel(std::istream *inStream) {
+	Model model; 
+	tinyobj::attrib_t attrib;
+	std::vector<tinyobj::shape_t> shapes;
+	std::vector<tinyobj::material_t> materials;
+	std::string warn, err;
+
+	if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &err, inStream, NULL )) {
+		throw std::runtime_error(warn + err);
+	}
+
+	std::unordered_map<Vertex, uint32_t> uniqueVertices = {};
+
+	for (const auto& shape : shapes) {
+		for (const auto& index : shape.mesh.indices) {
+			Vertex vertex = {};
+
+
+			vertex.pos = {
+				attrib.vertices[3 * index.vertex_index + 0],
+				attrib.vertices[3 * index.vertex_index + 1],
+				attrib.vertices[3 * index.vertex_index + 2]
+			};
+
+			vertex.texCoord = {
+				attrib.texcoords[2 * index.texcoord_index + 0],
+				1.0f - attrib.texcoords[2 * index.texcoord_index + 1]
+			};
+
+			vertex.color = {1.0f, 1.0f, 1.0f};
+
+			if (uniqueVertices.count(vertex) == 0) {
+				uniqueVertices[vertex] = static_cast<uint32_t>(model.vertices.size());
+				model.vertices.push_back(vertex);
+			}
+
+			model.indices.push_back(uniqueVertices[vertex]);
+		}
+	}
+	return &model;
+}
+
+namespace std {
+    template<> struct hash<Vertex> {
+        size_t operator()(Vertex const& vertex) const {
+            return ((hash<glm::vec3>()(vertex.pos) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^ (hash<glm::vec2>()(vertex.texCoord) << 1);
+        }
+    };
+}
 
 /**
  * Current rotation angle (in degrees, updated per frame).
@@ -40,16 +115,16 @@ float rotDeg = 0.0f;
  */
 static char const triangle_vert_wgsl[] = R"(
 	struct VertexIn {
-		@location(0) aPos : vec2<f32>;
-		@location(1) aCol : vec3<f32>;
+		@location(0) aPos : vec2<f32>,
+		@location(1) aCol : vec3<f32>
 	};
 	struct VertexOut {
-		@location(0) vCol : vec3<f32>;
-		@builtin(position) Position : vec4<f32>;
+		@location(0) vCol : vec3<f32>,
+		@builtin(position) Position : vec4<f32>
 	};
 
 	struct Rotation {
-		@location(0) degs : f32;
+		@location(0) degs : f32
 	};
 	@group(0)  @binding(0) var<uniform> uRot : Rotation;
 	@stage(vertex)
@@ -78,24 +153,6 @@ static char const triangle_frag_wgsl[] = R"(
 		return vec4<f32>(vCol, 1.0);
 	}
 )";
-
-/**
- * Helper to create a shader from SPIR-V IR.
- *
- * \param[in] code shader source (output using the \c -V \c -x options in \c glslangValidator)
- * \param[in] size size of \a code in bytes
- * \param[in] label optional shader name
- */
-/*static*/ WGPUShaderModule createShader(const uint32_t* code, uint32_t size, const char* label = nullptr) {
-	WGPUShaderModuleSPIRVDescriptor spirv = {};
-	spirv.chain.sType = WGPUSType_ShaderModuleSPIRVDescriptor;
-	spirv.codeSize = size / sizeof(uint32_t);
-	spirv.code = code;
-	WGPUShaderModuleDescriptor desc = {};
-	desc.nextInChain = reinterpret_cast<WGPUChainedStruct*>(&spirv);
-	desc.label = label;
-	return wgpuDeviceCreateShaderModule(device, &desc);
-}
 
 /**
  * Helper to create a shader from WGSL source.
@@ -303,10 +360,10 @@ static bool redraw() {
 	colorDesc.view    = backBufView;
 	colorDesc.loadOp  = WGPULoadOp_Clear;
 	colorDesc.storeOp = WGPUStoreOp_Store;
-	colorDesc.clearColor.r = 0.3f;
-	colorDesc.clearColor.g = 1.0f;
-	colorDesc.clearColor.b = 0.3f;
-	colorDesc.clearColor.a = 1.0f;
+	colorDesc.clearValue.r = 0.3f;
+	colorDesc.clearValue.g = 1.0f;
+	colorDesc.clearValue.b = 0.3f;
+	colorDesc.clearValue.a = 1.0f;
 
 	WGPURenderPassDescriptor renderPass = {};
 	renderPass.colorAttachmentCount = 1;
@@ -349,9 +406,16 @@ void response_callback(const sfetch_response_t* response) {
 	if (response->fetched) {
 		// data has been loaded, and is available via
 		// 'buffer_ptr' and 'fetched_size':
-		const void* data = response->buffer_ptr;
+		void* data = response->buffer_ptr;
 		uint64_t num_bytes = response->fetched_size;
 		std::string path(response->path);
+		if(endsWith(path, std::string("obj"))) {
+			std::stringstream ss;
+			ss.rdbuf()->sputn(static_cast<char*>(data), num_bytes);
+		 	resources.model = loadModel(&ss);
+		}
+
+		// model
 		
 	}
 	if (response->finished) {
@@ -369,7 +433,7 @@ extern "C" int __main__(int /*argc*/, char* /*argv*/[]) {
 		const sfetch_desc_t &a = { 0 };
 		sfetch_setup(a);
 
-		static uint8_t buf[1024 * 1024];
+		static uint8_t buf[1024 * 1024 * 50];
 
 		const sfetch_request_t &req = {
             .path = "screenshot.png",
@@ -415,4 +479,15 @@ extern "C" int __main__(int /*argc*/, char* /*argv*/[]) {
 	#endif
 	}
 	return 0;
+}
+
+
+static bool endsWith(std::string_view str, std::string_view suffix)
+{
+    return str.size() >= suffix.size() && 0 == str.compare(str.size()-suffix.size(), suffix.size(), suffix);
+}
+
+static bool startsWith(std::string_view str, std::string_view prefix)
+{
+    return str.size() >= prefix.size() && 0 == str.compare(0, prefix.size(), prefix);
 }

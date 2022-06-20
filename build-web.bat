@@ -35,7 +35,7 @@ set SRC=%SRC%lib/imgui/imgui_widgets.cpp
 set SRC=%SRC%lib/imgui/backends/imgui_impl_wgpu.cpp 
 set SRC=%SRC%lib/imgui/backends/imgui_impl_sdl.cpp 
 
-set INC=-Iinc -Ilib/imgui -Ilib/imgui/backends
+set INC=-Iinc -Ilib/imgui -Ilib/imgui/backends -I%USERPROFILE%/glm
 
 set OUT=index
 if not exist out\web mkdir out\web
