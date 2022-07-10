@@ -64,6 +64,16 @@
         "valarray": "cpp",
         "variant": "cpp",
         "vector": "cpp",
-        "algorithm": "cpp"
+        "algorithm": "cpp",
+        "set": "cpp",
+        "functional": "cpp",
+        "unordered_set": "cpp",
+        "chrono": "cpp",
+        "compare": "cpp",
+        "concepts": "cpp",
+        "deque": "cpp",
+        "numeric": "cpp",
+        "stack": "cpp",
+        "filesystem": "cpp"
     }
 }

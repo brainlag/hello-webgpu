@@ -15,6 +15,7 @@ out/ARM64/
 *.opensdf
 *.aps
 *.pdb
+*.wasm
 
 # Mac meta files
 .DS_Store

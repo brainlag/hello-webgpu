@@ -39,6 +39,7 @@ extern ImGuiID ImHashData(const void* data_p, size_t data_size, ImU32 seed = 0);
 static WGPUDevice               g_wgpuDevice = NULL;
 static WGPUQueue                g_defaultQueue = NULL;
 static WGPUTextureFormat        g_renderTargetFormat = WGPUTextureFormat_Undefined;
+static WGPUTextureFormat        g_depthStencilFormat = WGPUTextureFormat_Undefined;
 static WGPURenderPipeline       g_pipelineState = NULL;
 
 struct RenderResources
@@ -606,12 +607,11 @@ bool ImGui_ImplWGPU_CreateDeviceObjects()
 
     // Create depth-stencil State
     WGPUDepthStencilState depth_stencil_state = {};
-    depth_stencil_state.depthBias = 0;
-    depth_stencil_state.depthBiasClamp = 0;
-    depth_stencil_state.depthBiasSlopeScale = 0;
+    depth_stencil_state.format = g_depthStencilFormat;
+    depth_stencil_state.depthWriteEnabled = false;
 
     // Configure disabled depth-stencil state
-    graphics_pipeline_desc.depthStencil = nullptr;
+    graphics_pipeline_desc.depthStencil = &depth_stencil_state;
 
     g_pipelineState = wgpuDeviceCreateRenderPipeline(g_wgpuDevice, &graphics_pipeline_desc);
 
@@ -662,7 +662,7 @@ void ImGui_ImplWGPU_InvalidateDeviceObjects()
         SafeRelease(g_pFrameResources[i]);
 }
 
-bool ImGui_ImplWGPU_Init(WGPUDevice device, int num_frames_in_flight, WGPUTextureFormat rt_format)
+bool ImGui_ImplWGPU_Init(WGPUDevice device, int num_frames_in_flight, WGPUTextureFormat rt_format, WGPUTextureFormat depth_format)
 {
     // Setup backend capabilities flags
     ImGuiIO& io = ImGui::GetIO();
@@ -672,6 +672,7 @@ bool ImGui_ImplWGPU_Init(WGPUDevice device, int num_frames_in_flight, WGPUTextur
     g_wgpuDevice = device;
     g_defaultQueue = wgpuDeviceGetQueue(g_wgpuDevice);
     g_renderTargetFormat = rt_format;
+    g_depthStencilFormat = depth_format;
     g_pFrameResources = new FrameResources[num_frames_in_flight];
     g_numFramesInFlight = num_frames_in_flight;
     g_frameIndex = UINT_MAX;

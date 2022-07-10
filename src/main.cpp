@@ -6,6 +6,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <iostream>
+#include <array>
+#include <set>
+#include <algorithm>
 #include "json.hpp"
 
 #define GLM_FORCE_RADIANS
@@ -18,6 +21,8 @@
 
 #define SOKOL_FETCH_IMPL
 #include "sokol_fetch.h"
+
+#define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
 #define TINYOBJLOADER_IMPLEMENTATION
@@ -30,24 +35,59 @@ WGPUSwapChain swapchain;
 WGPURenderPipeline pipeline;
 WGPUBuffer vertBuf; // vertex buffer with triangle position and colours
 WGPUBuffer indxBuf; // index buffer
-WGPUBuffer uRotBuf; // uniform buffer (containing the rotation angle)
+WGPUBuffer cameraBuf; // uniform buffer (containing the camera)
+WGPUBuffer samplerBuf;
+WGPUBuffer texBuf;
 WGPUBindGroup bindGroup;
 
-struct Resources {
-	WGPUTexture texture1;
-	Model *model;
-};
-
-static Resources resources;
+WGPUTexture depthBuffer;
 
 struct Vertex {
     glm::vec3 pos;
     glm::vec3 color;
     glm::vec2 texCoord;
 
+
+
+	static WGPUVertexBufferLayout getLayout() {
+		std::array<WGPUVertexAttribute, 3> attributeDescriptions = {};
+
+		attributeDescriptions[0].format = WGPUVertexFormat_Float32x3;
+		attributeDescriptions[0].offset = offsetof(Vertex, pos);
+		attributeDescriptions[0].shaderLocation = 0;
+		attributeDescriptions[1].format = WGPUVertexFormat_Float32x3;
+		attributeDescriptions[1].offset = offsetof(Vertex, color);
+		attributeDescriptions[1].shaderLocation = 1;
+		attributeDescriptions[2].format = WGPUVertexFormat_Float32x2;
+		attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
+		attributeDescriptions[2].shaderLocation = 2;
+
+		
+		WGPUVertexBufferLayout vertexBufferLayout = {};
+		vertexBufferLayout.stepMode = WGPUVertexStepMode_Vertex;
+		vertexBufferLayout.arrayStride = sizeof(Vertex);
+		vertexBufferLayout.attributeCount = attributeDescriptions.size();
+		vertexBufferLayout.attributes = attributeDescriptions.data();
+		return vertexBufferLayout;
+	}
+
 	bool operator==(const Vertex& other) const {
 			return pos == other.pos && color == other.color && texCoord == other.texCoord;
 		}
+};
+
+namespace std {
+    template<> struct hash<Vertex> {
+        size_t operator()(Vertex const& vertex) const {
+            return ((hash<glm::vec3>()(vertex.pos) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^ (hash<glm::vec2>()(vertex.texCoord) << 1);
+        }
+    };
+}
+
+struct UniformBufferObject {
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
 };
 
 struct Model {
@@ -55,7 +95,15 @@ struct Model {
 	std::vector<uint32_t> indices;
 };
 
-static Model* loadModel(std::istream *inStream) {
+struct Resources {
+	WGPUTexture texture1;
+	Model model;
+	int count = 2;
+};
+
+static Resources resources;
+
+static Model loadModel(std::istream *inStream) {
 	Model model; 
 	tinyobj::attrib_t attrib;
 	std::vector<tinyobj::shape_t> shapes;
@@ -63,7 +111,7 @@ static Model* loadModel(std::istream *inStream) {
 	std::string warn, err;
 
 	if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &err, inStream, NULL )) {
-		throw std::runtime_error(warn + err);
+		return model;
 	}
 
 	std::unordered_map<Vertex, uint32_t> uniqueVertices = {};
@@ -94,21 +142,19 @@ static Model* loadModel(std::istream *inStream) {
 			model.indices.push_back(uniqueVertices[vertex]);
 		}
 	}
-	return &model;
+	return model;
 }
 
-namespace std {
-    template<> struct hash<Vertex> {
-        size_t operator()(Vertex const& vertex) const {
-            return ((hash<glm::vec3>()(vertex.pos) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^ (hash<glm::vec2>()(vertex.texCoord) << 1);
-        }
-    };
+
+static bool endsWith(std::string_view str, std::string_view suffix)
+{
+    return str.size() >= suffix.size() && 0 == str.compare(str.size()-suffix.size(), suffix.size(), suffix);
 }
 
-/**
- * Current rotation angle (in degrees, updated per frame).
- */
-float rotDeg = 0.0f;
+static bool startsWith(std::string_view str, std::string_view prefix)
+{
+    return str.size() >= prefix.size() && 0 == str.compare(0, prefix.size(), prefix);
+}
 
 /**
  * WGSL equivalent of \c triangle_vert_spirv.
@@ -140,6 +186,49 @@ static char const triangle_vert_wgsl[] = R"(
 		output.Position = vec4<f32>(rot * vec3<f32>(input.aPos, 1.0), 1.0);
 		output.vCol = input.aCol;
 		return output;
+	}
+)";
+
+static char const triangle_vert_wgsl_new[] = R"(
+	struct VertexIn {
+		@location(0) inPosition : vec3<f32>,
+		@location(1) inColor : vec3<f32>,
+		@location(2) inTexCoord : vec2<f32>
+	};
+	struct VertexOut {
+		@location(0) fragColor : vec3<f32>,
+		@location(1) fragTexCoord : vec2<f32>,
+		@builtin(position) Position : vec4<f32>
+	};
+	struct Camera {
+		model : mat4x4<f32>,
+		view : mat4x4<f32>,
+		proj : mat4x4<f32>
+	};
+	@group(0)  @binding(0) var<uniform> camera : Camera;
+
+	@vertex
+	fn main(input : VertexIn) -> VertexOut {
+		var output : VertexOut;
+ 		output.Position = camera.proj * camera.view * camera.model * vec4<f32>(input.inPosition, 1.0);
+    	output.fragColor = input.inColor;
+    	output.fragTexCoord = input.inTexCoord;
+		return output;
+	}
+)";
+
+static char const triangle_frag_wgsl_new[] = R"(
+	struct FragIn {
+		@location(0) fragColor : vec3<f32>,
+		@location(1) fragTexCoord : vec2<f32>,
+	}
+
+	@group(0)  @binding(1) var t: texture_2d<f32>;
+	@group(0)  @binding(2) var s: sampler;
+
+	@fragment
+	fn main(input : FragIn) -> @location(0) vec4<f32> {
+		return textureSample(t, s, input.fragTexCoord);
 	}
 )";
 
@@ -175,8 +264,10 @@ static WGPUTexture createTexture(const void* data, uint32_t width, uint32_t heig
 	WGPUTextureDescriptor tex = {};
 	tex.dimension = WGPUTextureDimension_2D;
 	tex.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
-	tex.format = WGPUTextureFormat_BGRA8Unorm;
-	tex.size = { .width = width, .height = height};
+	tex.format = WGPUTextureFormat_RGBA8Unorm;
+	tex.size = { .width = width, .height = height, .depthOrArrayLayers = 1};
+	tex.mipLevelCount = 1;
+	tex.sampleCount = 1;
 	WGPUTexture texture = wgpuDeviceCreateTexture(device, &tex);
 	WGPUImageCopyTexture copyTex = {};
 	copyTex.texture = texture;
@@ -189,22 +280,40 @@ static WGPUTexture createTexture(const void* data, uint32_t width, uint32_t heig
 	layout.rowsPerImage = height;
 	WGPUExtent3D size = {width, height, 1 };
 	wgpuQueueWriteTexture(queue, &copyTex, data, width * height * size_pp, &layout, &size);
+	return texture;
 }
 
-/**
- * Helper to create a buffer.
- *
- * \param[in] data pointer to the start of the raw data
- * \param[in] size number of bytes in \a data
- * \param[in] usage type of buffer
- */
-static WGPUBuffer createBuffer(const void* data, size_t size, WGPUBufferUsage usage) {
+static WGPUTexture createDepthBuffer() {
+	WGPUTextureDescriptor tex = {};
+	tex.dimension = WGPUTextureDimension_2D;
+	tex.usage = WGPUTextureUsage_RenderAttachment;
+	tex.format = WGPUTextureFormat_Depth32Float;
+	tex.size = { .width = 1900, .height = 937, .depthOrArrayLayers = 1};
+	tex.mipLevelCount = 1;
+	tex.sampleCount = 1;
+	return wgpuDeviceCreateTexture(device, &tex);
+}
+
+static WGPUBuffer createBuffer(size_t size, WGPUBufferUsage usage) {
 	WGPUBufferDescriptor desc = {};
 	desc.usage = WGPUBufferUsage_CopyDst | usage;
 	desc.size  = size;
 	WGPUBuffer buffer = wgpuDeviceCreateBuffer(device, &desc);
+	return buffer;
+}
+
+static WGPUBuffer createBuffer(const void* data, size_t size, WGPUBufferUsage usage) {
+	WGPUBuffer buffer = createBuffer(size, usage);
 	wgpuQueueWriteBuffer(queue, buffer, 0, data, size);
 	return buffer;
+}
+
+static WGPUSampler createSampler() {
+	WGPUSamplerDescriptor desc = {};
+	desc.minFilter = WGPUFilterMode_Linear;
+	desc.magFilter = WGPUFilterMode_Linear;
+	WGPUSampler sampler = wgpuDeviceCreateSampler(device, &desc);
+	return sampler;
 }
 
 /**
@@ -213,23 +322,38 @@ static WGPUBuffer createBuffer(const void* data, size_t size, WGPUBufferUsage us
 static void createPipelineAndBuffers() {
 	// compile shaders
 	// NOTE: these are now the WGSL shaders (tested with Dawn and Chrome Canary)
-	WGPUShaderModule vertMod = createShader(triangle_vert_wgsl);
-	WGPUShaderModule fragMod = createShader(triangle_frag_wgsl);
+	WGPUShaderModule vertMod = createShader(triangle_vert_wgsl_new);
+	WGPUShaderModule fragMod = createShader(triangle_frag_wgsl_new);
 	
+	printf("checkpoint 1\n");
 
+	depthBuffer = createDepthBuffer();
 
 	WGPUBufferBindingLayout buf = {};
 	buf.type = WGPUBufferBindingType_Uniform;
 
-	// bind group layout (used by both the pipeline layout and uniform bind group, released at the end of this function)
-	WGPUBindGroupLayoutEntry bglEntry = {};
-	bglEntry.binding = 0;
-	bglEntry.visibility = WGPUShaderStage_Vertex;
-	bglEntry.buffer = buf;
 
+	// bind group layout (used by both the pipeline layout and uniform bind group, released at the end of this function)
+	WGPUBindGroupLayoutEntry bglVertexEntry = {};
+	bglVertexEntry.binding = 0;
+	bglVertexEntry.visibility = WGPUShaderStage_Vertex;
+	bglVertexEntry.buffer.type = WGPUBufferBindingType_Uniform;
+
+	WGPUBindGroupLayoutEntry bglFragmentEntry = {};
+	bglFragmentEntry.binding = 1;
+	bglFragmentEntry.visibility = WGPUShaderStage_Fragment;
+	bglFragmentEntry.texture.sampleType = WGPUTextureSampleType_Float;
+	bglFragmentEntry.texture.viewDimension = WGPUTextureViewDimension_2D;
+
+	WGPUBindGroupLayoutEntry sampleEntry = {};
+	sampleEntry.binding = 2;
+	sampleEntry.visibility = WGPUShaderStage_Fragment;
+	sampleEntry.sampler.type = WGPUSamplerBindingType_Filtering;
+
+	WGPUBindGroupLayoutEntry ents[3] = {bglVertexEntry, bglFragmentEntry, sampleEntry};
 	WGPUBindGroupLayoutDescriptor bglDesc = {};
-	bglDesc.entryCount = 1;
-	bglDesc.entries = &bglEntry;
+	bglDesc.entryCount = 3;
+	bglDesc.entries = ents;
 	WGPUBindGroupLayout bindGroupLayout = wgpuDeviceCreateBindGroupLayout(device, &bglDesc);
 
 	// pipeline layout (used by the render pipeline, released after its creation)
@@ -238,28 +362,16 @@ static void createPipelineAndBuffers() {
 	layoutDesc.bindGroupLayouts = &bindGroupLayout;
 	WGPUPipelineLayout pipelineLayout = wgpuDeviceCreatePipelineLayout(device, &layoutDesc);
 
-	// describe buffer layouts
-	WGPUVertexAttribute vertAttrs[2] = {};
-	vertAttrs[0].format = WGPUVertexFormat_Float32x2;
-	vertAttrs[0].offset = 0;
-	vertAttrs[0].shaderLocation = 0;
-	vertAttrs[1].format = WGPUVertexFormat_Float32x3;
-	vertAttrs[1].offset = 2 * sizeof(float);
-	vertAttrs[1].shaderLocation = 1;
-	WGPUVertexBufferLayout vertexBufferLayout = {};
-	vertexBufferLayout.stepMode = WGPUVertexStepMode_Vertex;
-	vertexBufferLayout.arrayStride = 5 * sizeof(float);
-	vertexBufferLayout.attributeCount = 2;
-	vertexBufferLayout.attributes = vertAttrs;
+	printf("checkpoint 2\n");
 
 	// Fragment state
 	WGPUBlendState blend = {};
 	blend.color.operation = WGPUBlendOperation_Add;
 	blend.color.srcFactor = WGPUBlendFactor_One;
-	blend.color.dstFactor = WGPUBlendFactor_One;
+	blend.color.dstFactor = WGPUBlendFactor_Zero;
 	blend.alpha.operation = WGPUBlendOperation_Add;
 	blend.alpha.srcFactor = WGPUBlendFactor_One;
-	blend.alpha.dstFactor = WGPUBlendFactor_One;
+	blend.alpha.dstFactor = WGPUBlendFactor_Zero;
 
 	WGPUColorTargetState colorTarget = {};
 	colorTarget.format = webgpu::getSwapChainFormat(device);
@@ -275,13 +387,37 @@ static void createPipelineAndBuffers() {
 	WGPURenderPipelineDescriptor desc = {};
 	desc.fragment = &fragment;
 
+	WGPUDepthStencilState depthState = {};
+	depthState.depthWriteEnabled = true;
+	depthState.depthCompare = WGPUCompareFunction_Less;
+	depthState.format = WGPUTextureFormat_Depth32Float;
+
 	// Other state
 	desc.layout = pipelineLayout;
-	desc.depthStencil = nullptr;
+	desc.depthStencil = &depthState;
+
+	std::array<WGPUVertexAttribute, 3> attributeDescriptions = {};
+
+	attributeDescriptions[0].format = WGPUVertexFormat_Float32x3;
+	attributeDescriptions[0].offset = offsetof(Vertex, pos);
+	attributeDescriptions[0].shaderLocation = 0;
+	attributeDescriptions[1].format = WGPUVertexFormat_Float32x3;
+	attributeDescriptions[1].offset = offsetof(Vertex, color);
+	attributeDescriptions[1].shaderLocation = 1;
+	attributeDescriptions[2].format = WGPUVertexFormat_Float32x2;
+	attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
+	attributeDescriptions[2].shaderLocation = 2;
+
+
+	WGPUVertexBufferLayout vertexBufferLayout = {};
+	vertexBufferLayout.stepMode = WGPUVertexStepMode_Vertex;
+	vertexBufferLayout.arrayStride = sizeof(Vertex);
+	vertexBufferLayout.attributeCount = attributeDescriptions.size();
+	vertexBufferLayout.attributes = attributeDescriptions.data();
 
 	desc.vertex.module = vertMod;
 	desc.vertex.entryPoint = "main";
-	desc.vertex.bufferCount = 1;//0;
+	desc.vertex.bufferCount = 1;
 	desc.vertex.buffers = &vertexBufferLayout;
 
 	desc.multisample.count = 1;
@@ -295,43 +431,83 @@ static void createPipelineAndBuffers() {
 
 	pipeline = wgpuDeviceCreateRenderPipeline(device, &desc);
 
+	printf("checkpoint 3\n");
+
 	// partial clean-up (just move to the end, no?)
 	wgpuPipelineLayoutRelease(pipelineLayout);
 
 	wgpuShaderModuleRelease(fragMod);
 	wgpuShaderModuleRelease(vertMod);
 
-	// create the buffers (x, y, r, g, b)
-	float const vertData[] = {
-		-0.8f, -0.8f, 0.0f, 0.0f, 1.0f, // BL
-		 0.8f, -0.8f, 0.0f, 1.0f, 0.0f, // BR
-		-0.0f,  0.8f, 1.0f, 0.0f, 0.0f, // top
-	};
-	uint16_t const indxData[] = {
-		0, 1, 2,
-		0 // padding (better way of doing this?)
-	};
-	vertBuf = createBuffer(vertData, sizeof(vertData), WGPUBufferUsage_Vertex);
-	indxBuf = createBuffer(indxData, sizeof(indxData), WGPUBufferUsage_Index);
+	auto verts = resources.model.vertices;
+	auto indices = resources.model.indices;
 
-	// create the uniform bind group (note 'rotDeg' is copied here, not bound in any way)
-	uRotBuf = createBuffer(&rotDeg, sizeof(rotDeg), WGPUBufferUsage_Uniform);
+	auto vertBufferSize = sizeof(verts[0]) * verts.size();
+	auto indicesBufferSize = sizeof(indices[0]) * indices.size();
+
+	vertBuf = createBuffer(verts.data(), vertBufferSize, WGPUBufferUsage_Vertex);
+	indxBuf = createBuffer(indices.data(), indicesBufferSize, WGPUBufferUsage_Index);
+
+
+	// create the uniform bind group 
+	auto cameraSize = sizeof(struct UniformBufferObject);
+	cameraBuf = createBuffer(cameraSize, WGPUBufferUsage_Uniform);
+	
+	WGPUTextureViewDescriptor viewDesc = {};
+	viewDesc.aspect = WGPUTextureAspect_All;
+	viewDesc.format = WGPUTextureFormat_RGBA8Unorm;
+	viewDesc.dimension = WGPUTextureViewDimension_2D;
+	viewDesc.baseMipLevel = 0;
+	viewDesc.mipLevelCount = 1;
+	viewDesc.baseArrayLayer = 0;
+	viewDesc.arrayLayerCount = 1;
+
+	WGPUTextureView view = wgpuTextureCreateView(resources.texture1, &viewDesc);
+
+	WGPUSamplerDescriptor samplerDesc = {};
+	samplerDesc.minFilter = WGPUFilterMode_Linear;
+	samplerDesc.magFilter = WGPUFilterMode_Linear;
+	WGPUSampler sampler = wgpuDeviceCreateSampler(device, &samplerDesc);
 
 	WGPUBindGroupEntry bgEntry = {};
 	bgEntry.binding = 0;
-	bgEntry.buffer = uRotBuf;
+	bgEntry.buffer = cameraBuf;
 	bgEntry.offset = 0;
-	bgEntry.size = sizeof(rotDeg);
+	bgEntry.size = cameraSize;
 
+	WGPUBindGroupEntry bgEntry2 = {};
+	bgEntry2.binding = 1;
+	bgEntry2.textureView = view;
+
+	WGPUBindGroupEntry bgEntry3 = {};
+	bgEntry3.binding = 2;
+	bgEntry3.sampler = sampler;
+
+	WGPUBindGroupEntry bgEnts[3] = {bgEntry, bgEntry2, bgEntry3};
 	WGPUBindGroupDescriptor bgDesc = {};
 	bgDesc.layout = bindGroupLayout;
-	bgDesc.entryCount = 1;
-	bgDesc.entries = &bgEntry;
+	bgDesc.entryCount = 3;
+	bgDesc.entries = bgEnts;
 
 	bindGroup = wgpuDeviceCreateBindGroup(device, &bgDesc);
 
 	// last bit of clean-up
 	wgpuBindGroupLayoutRelease(bindGroupLayout);
+}
+
+static void updateCamera() {
+	static auto startTime = std::chrono::high_resolution_clock::now();
+
+	auto currentTime = std::chrono::high_resolution_clock::now();
+	float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+
+	UniformBufferObject ubo = {};
+	ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+	ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+	ubo.proj = glm::perspective(glm::radians(45.0f), 1900 / (float) 937, 0.1f, 10.0f);
+	//ubo.proj[1][1] *= -1;
+
+	wgpuQueueWriteBuffer(queue, cameraBuf, 0, &ubo, sizeof(ubo));
 }
 
 /**
@@ -341,7 +517,7 @@ static void createPipelineAndBuffers() {
 static bool show_demo_window = true;
 static bool redraw() {
 
-	sfetch_dowork(); 
+	sfetch_dowork();
 
  	SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -351,7 +527,6 @@ static bool redraw() {
 	ImGui_ImplWGPU_NewFrame();
 	ImGui_ImplSDL2_NewFrame();
 	ImGui::NewFrame();
-
   	ImGui::ShowDemoWindow(&show_demo_window);
 	ImGui::Render();
 
@@ -360,28 +535,41 @@ static bool redraw() {
 	colorDesc.view    = backBufView;
 	colorDesc.loadOp  = WGPULoadOp_Clear;
 	colorDesc.storeOp = WGPUStoreOp_Store;
-	colorDesc.clearValue.r = 0.3f;
-	colorDesc.clearValue.g = 1.0f;
-	colorDesc.clearValue.b = 0.3f;
-	colorDesc.clearValue.a = 1.0f;
+
+
+	WGPUTextureViewDescriptor viewDesc = {};
+	viewDesc.aspect = WGPUTextureAspect_DepthOnly;
+	viewDesc.format = WGPUTextureFormat_Depth32Float;
+	viewDesc.dimension = WGPUTextureViewDimension_2D;
+	viewDesc.baseMipLevel = 0;
+	viewDesc.mipLevelCount = 1;
+	viewDesc.baseArrayLayer = 0;
+	viewDesc.arrayLayerCount = 1;
+	WGPUTextureView depthView = wgpuTextureCreateView(depthBuffer, &viewDesc);
+
+	WGPURenderPassDepthStencilAttachment depthDesc = {};
+	depthDesc.view = depthView;
+	depthDesc.depthClearValue = 1.0;
+	depthDesc.depthLoadOp = WGPULoadOp_Clear;
+	depthDesc.depthStoreOp = WGPUStoreOp_Store;
+	depthDesc.stencilLoadOp = WGPULoadOp_Undefined;
+	depthDesc.stencilStoreOp = WGPUStoreOp_Undefined;
 
 	WGPURenderPassDescriptor renderPass = {};
 	renderPass.colorAttachmentCount = 1;
 	renderPass.colorAttachments = &colorDesc;
+	renderPass.depthStencilAttachment = &depthDesc;
 
 	WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, nullptr);			// create encoder
 	WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &renderPass);	// create pass
 
-	// update the rotation
-	rotDeg += 0.1f;
-	wgpuQueueWriteBuffer(queue, uRotBuf, 0, &rotDeg, sizeof(rotDeg));
+	updateCamera();
 
-	// draw the triangle (comment these five lines to simply clear the screen)
 	wgpuRenderPassEncoderSetPipeline(pass, pipeline);
 	wgpuRenderPassEncoderSetBindGroup(pass, 0, bindGroup, 0, 0);
-	wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vertBuf, 0, WGPU_WHOLE_SIZE); //60
-	wgpuRenderPassEncoderSetIndexBuffer(pass, indxBuf, WGPUIndexFormat_Uint16, 0, WGPU_WHOLE_SIZE); //8
-	wgpuRenderPassEncoderDrawIndexed(pass, 3, 1, 0, 0, 0);
+	wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vertBuf, 0, WGPU_WHOLE_SIZE);
+	wgpuRenderPassEncoderSetIndexBuffer(pass, indxBuf, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+	wgpuRenderPassEncoderDrawIndexed(pass, resources.model.indices.size(), 1, 0, 0, 0);
 
 	ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), pass);
 	wgpuRenderPassEncoderEnd(pass);
@@ -414,9 +602,12 @@ void response_callback(const sfetch_response_t* response) {
 			ss.rdbuf()->sputn(static_cast<char*>(data), num_bytes);
 		 	resources.model = loadModel(&ss);
 		}
-
-		// model
-		
+		if(endsWith(path, std::string("png"))) {
+			int texWidth, texHeight, texChannels;
+			stbi_uc* pixels = stbi_load_from_memory(static_cast<unsigned char*>(data), num_bytes, &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+			resources.texture1 = createTexture(pixels, texWidth, texHeight);
+		}
+		resources.count--;
 	}
 	if (response->finished) {
 			printf("Done\n");
@@ -430,19 +621,30 @@ void response_callback(const sfetch_response_t* response) {
 extern "C" int __main__(int /*argc*/, char* /*argv*/[]) {
 	if (window::Handle wHnd = window::create()) {
 
-		const sfetch_desc_t &a = { 0 };
+		const sfetch_desc_t &a = {};
 		sfetch_setup(a);
 
 		static uint8_t buf[1024 * 1024 * 50];
 
 		const sfetch_request_t &req = {
-            .path = "screenshot.png",
+            .path = "data/viking_room.obj",
             .callback = response_callback,
             .buffer_ptr = buf,
             .buffer_size = sizeof(buf)
         };
 
         sfetch_send(req);
+
+		static uint8_t buf2[1024 * 1024 * 3];
+
+		const sfetch_request_t &req2 = {
+            .path = "data/viking_room.png",
+            .callback = response_callback,
+            .buffer_ptr = buf2,
+            .buffer_size = sizeof(buf2)
+        };
+
+        sfetch_send(req2);
 
 		SDL_Init(SDL_INIT_NOPARACHUTE);
 		SDL_Window *window = SDL_CreateWindow("Egal", 0, 0, 1900, 937, 0);
@@ -457,8 +659,12 @@ extern "C" int __main__(int /*argc*/, char* /*argv*/[]) {
 		if ((device = webgpu::create(wHnd))) {
 			queue = wgpuDeviceGetQueue(device);
 			swapchain = webgpu::createSwapChain(device);
-    		ImGui_ImplWGPU_Init(device, 3, WGPUTextureFormat_BGRA8Unorm);
+    		ImGui_ImplWGPU_Init(device, 3, WGPUTextureFormat_BGRA8Unorm, WGPUTextureFormat_Depth32Float);
 			ImGui_ImplWGPU_CreateDeviceObjects();
+			while(resources.count > 0) {
+				sfetch_dowork();
+				emscripten_sleep(100);
+			}
 			createPipelineAndBuffers();
 			window::show(wHnd);
 			window::loop(wHnd, redraw);
@@ -479,15 +685,4 @@ extern "C" int __main__(int /*argc*/, char* /*argv*/[]) {
 	#endif
 	}
 	return 0;
-}
-
-
-static bool endsWith(std::string_view str, std::string_view suffix)
-{
-    return str.size() >= suffix.size() && 0 == str.compare(str.size()-suffix.size(), suffix.size(), suffix);
-}
-
-static bool startsWith(std::string_view str, std::string_view prefix)
-{
-    return str.size() >= prefix.size() && 0 == str.compare(0, prefix.size(), prefix);
 }
